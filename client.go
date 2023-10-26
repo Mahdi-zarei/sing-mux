@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
@@ -22,6 +23,10 @@ type Client struct {
 	padding        bool
 	access         sync.Mutex
 	connections    list.List[abstractSession]
+	lastActive     time.Time
+	closeChan      chan struct{}
+	checkIdle      chan struct{}
+	checkDone      chan struct{}
 }
 
 type Options struct {
@@ -40,6 +45,9 @@ func NewClient(options Options) (*Client, error) {
 		minStreams:     options.MinStreams,
 		maxStreams:     options.MaxStreams,
 		padding:        options.Padding,
+		closeChan:      make(chan struct{}),
+		checkIdle:      make(chan struct{}),
+		checkDone:      make(chan struct{}),
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
@@ -57,7 +65,54 @@ func NewClient(options Options) (*Client, error) {
 	default:
 		return nil, E.New("unknown protocol: " + options.Protocol)
 	}
+
+	go client.watchClientConns()
+
 	return client, nil
+}
+
+func (c *Client) GetClientIdleTime() time.Duration {
+	c.checkIdle <- struct{}{}
+	<-c.checkDone
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.lastActive.IsZero() {
+		return 0
+	}
+	return time.Since(c.lastActive)
+}
+
+func (c *Client) watchClientConns() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for {
+		select {
+		case <-c.closeChan:
+			return
+		case <-ticker.C:
+			c.updateLastActive()
+		case <-c.checkIdle:
+			c.updateLastActive()
+			c.checkDone <- struct{}{}
+		}
+	}
+}
+
+func (c *Client) updateLastActive() {
+	c.access.Lock()
+	defer c.access.Unlock()
+	for element := c.connections.Front(); element != nil; {
+		if element.Value.IsClosed() {
+			nextElement := element.Next()
+			c.connections.Remove(element)
+			_ = element.Value.Close()
+			element = nextElement
+			continue
+		}
+		element = element.Next()
+	}
+	if c.connections.IsEmpty() && c.lastActive.IsZero() {
+		c.lastActive = time.Now()
+	}
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -119,6 +174,7 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		if element.Value.IsClosed() {
 			nextElement := element.Next()
 			c.connections.Remove(element)
+			_ = element.Value.Close()
 			element = nextElement
 			continue
 		}
@@ -170,6 +226,7 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 		return nil, err
 	}
 	c.connections.PushBack(session)
+	c.lastActive = time.Time{}
 	return session, nil
 }
 
@@ -184,5 +241,10 @@ func (c *Client) Reset() {
 
 func (c *Client) Close() error {
 	c.Reset()
+	select {
+	case <-c.closeChan:
+	default:
+		close(c.closeChan)
+	}
 	return nil
 }
